@@ -1,0 +1,32 @@
+# --- PlatformIO/Arduino ---
+.pio/
+.pioenvs/
+.piolibdeps/
+.clang_complete
+.gcc-flags.json
+compile_commands.json
+
+# --- VS Code ---
+.vscode/
+
+# --- Python & Virtualenv ---
+.venv/
+venv/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+backend/__pycache__/
+
+# --- Local configs / Secret Credentials ---
+include/config.h
+backend/.env
+backend/.env.local
+
+# --- Databases / SQLite / Output Data ---
+*.db
+backend/sensor_history.db
+
+# --- OS temporary files ---
+.DS_Store
+Thumbs.db

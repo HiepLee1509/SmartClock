@@ -1,0 +1,10 @@
+{
+  "class_names": [
+    "Hypertension",
+    "Normal",
+    "Prehypertension"
+  ],
+  "beat_len": 256,
+  "fs": 1000,
+  "accuracy": 0.8308
+}

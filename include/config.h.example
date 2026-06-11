@@ -1,0 +1,45 @@
+#ifndef CONFIG_H
+#define CONFIG_H
+
+// --- WIFI CONFIG ---
+#define WIFI_SSID "YOUR_WIFI_SSID"
+#define WIFI_PASS "YOUR_WIFI_PASSWORD"
+
+// --- MQTT CONFIG (Adafruit IO) ---
+#define MQTT_BROKER "io.adafruit.com"
+#define MQTT_PORT 1883
+#define ADAFRUIT_IO_USERNAME "YOUR_ADAFRUIT_IO_USERNAME"
+#define ADAFRUIT_IO_KEY "YOUR_ADAFRUIT_IO_KEY"
+
+#define MQTT_PUBLISH_ENV_INTERVAL_MS 10000    // Gửi dữ liệu môi trường định kỳ mỗi 10 giây
+#define MQTT_PUBLISH_HEALTH_INTERVAL_MS 3000  // Gửi dữ liệu sức khỏe định kỳ mỗi 3 giây
+#define MQTT_RECONNECT_INTERVAL_MS                                             \
+  5000 // Thử lại kết nối sau mỗi 5 giây nếu ngắt kết nối
+
+// --- PIN DEFINITIONS ---
+#define I2C_SDA_PIN 8
+#define I2C_SCL_PIN 9
+#define I2C_SPEED 400000 // Fast mode 400kHz
+
+#define TOUCH_BUTTON_PIN 3 // GPIO3 (RX) được sử dụng làm chân Touch Button
+
+// --- SYSTEM CONFIG ---
+#define DEBUG_SERIAL 1          // Bật/tắt log Serial
+#define LONG_PRESS_TIME_MS 3000 // 3 giây để kích hoạt Deep Sleep
+
+// --- UI STATES ---
+enum ScreenState {
+  SCREEN_CLOCK = 0, // Trang 1 (Home mới): Hiển thị ngày giờ
+  SCREEN_ENV,       // Trang 2: Nhiệt độ, độ ẩm phòng
+  SCREEN_HEALTH,    // Trang 3: Sức khỏe (BPM, SpO2)
+  SCREEN_MAX_STATES
+};
+
+// --- TOUCH ACTIONS ---
+enum TouchAction {
+  TOUCH_NONE = 0,
+  TOUCH_SHORT, // Single tap
+  TOUCH_LONG   // Nhấn giữ 3-4s
+};
+
+#endif // CONFIG_H
