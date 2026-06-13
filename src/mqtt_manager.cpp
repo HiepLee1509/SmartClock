@@ -3,7 +3,6 @@
 #include <PubSubClient.h>
 #include <WiFi.h>
 
-// Khởi tạo WiFiClient và PubSubClient
 static WiFiClient espClient;
 static PubSubClient mqttClient(espClient);
 
@@ -25,12 +24,10 @@ static bool publish_feed(const char *feed_name, const char *payload) {
 void mqtt_init() { mqttClient.setServer(MQTT_BROKER, MQTT_PORT); }
 
 void mqtt_loop() {
-  // 1. Kiểm tra kết nối Wi-Fi, nếu chưa kết nối thì bỏ qua
   if (WiFi.status() != WL_CONNECTED) {
     return;
   }
 
-  // 2. Nếu đã có Wi-Fi nhưng chưa kết nối MQTT
   if (!mqttClient.connected()) {
     unsigned long now = millis();
     // Kiểm tra xem đã đủ thời gian giãn cách giữa các lần reconnect chưa
@@ -41,8 +38,6 @@ void mqtt_loop() {
       String clientId =
           "ESP32C3-Clock-" + String((uint32_t)ESP.getEfuseMac(), HEX);
 
-      // Tiến hành kết nối tới Adafruit IO (username làm username, Active Key
-      // làm password)
       if (mqttClient.connect(clientId.c_str(), ADAFRUIT_IO_USERNAME,
                              ADAFRUIT_IO_KEY)) {
         Serial.println("MQTT Connected!");
@@ -52,8 +47,6 @@ void mqtt_loop() {
       }
     }
   } else {
-    // 3. Nếu đã kết nối MQTT, gọi client.loop() để xử lý các gói tin
-    // keepalive/subscribe
     mqttClient.loop();
   }
 }

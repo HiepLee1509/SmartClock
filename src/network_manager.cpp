@@ -13,12 +13,12 @@ const int   daylightOffset_sec = 0;
 void network_init() {
     Serial.println("\n--- WIFI CONNECTING ---");
     
-    // 1. Reset cấu hình cũ
+    // Reset cấu hình cũ
     WiFi.disconnect(true, true);
     delay(500);
     WiFi.mode(WIFI_STA);
 
-    // 2. Xóa cấu hình IP tĩnh cũ (nếu có) để nhận DHCP mới
+    // Xóa cấu hình IP tĩnh cũ (nếu có) để nhận DHCP mới
     WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
 
     WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -26,7 +26,7 @@ void network_init() {
     // Đặt công suất phát sóng Wi-Fi về 8.5dBm để tránh sụt áp và nhiễu phản xạ RF trên ESP32-C3 Super Mini
     WiFi.setTxPower(WIFI_POWER_8_5dBm);
     
-    // 3. Đợi kết nối Wi-Fi (Tối đa 15 giây)
+    // Đợi kết nối Wi-Fi (Tối đa 15 giây)
     int timeout = 0;
     while (WiFi.status() != WL_CONNECTED && timeout < 30) {
         delay(500);

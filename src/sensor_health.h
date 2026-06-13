@@ -13,5 +13,6 @@ void health_update();
 int get_bpm();
 int get_spo2();
 long get_raw_ir(); // Cần thiết để vẽ biểu đồ hình sin (PPG) trên OLED
+bool health_is_ready(); // true khi đã thu đủ mẫu BPM để hiển thị ổn định
 
 #endif // SENSOR_HEALTH_H

@@ -1,26 +1,33 @@
 """
 Smart Health Clock - Backend Server
 ====================================
-Tech Stack: FastAPI, paho-mqtt, SQLite3, joblib (mocked)
+Tech Stack: FastAPI, paho-mqtt, SQLite3, google-generativeai, PyTorch
 
 Luồng dữ liệu:
   1. ESP32 -> Adafruit IO (MQTT) -> Server subscribe -> Ghi SQLite
-  2. Mobile App -> POST /api/profile -> Lưu RAM
-  3. BPM mới đến -> Kết hợp với profile -> AI predict -> Publish ai_feedback
+  2. Mobile App -> POST /api/profile -> Lưu RAM + SQLite
+  3. ESP32 -> HTTP POST /api/predict-bp -> AI TorchScript inference -> Publish ai_feedback
+  4. Mobile App -> POST /api/chat -> Gemini AI Cardiologist -> Trả lời
 """
-
 import os
+import json
 import sqlite3
-import random
 import logging
 import threading
+from pathlib import Path
 from datetime import datetime
 from contextlib import asynccontextmanager
+
+import numpy as np
+import torch
+from scipy.signal import butter, filtfilt, find_peaks, resample
 
 import paho.mqtt.client as mqtt
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 
 # Load environment variables from .env file
 load_dotenv()
@@ -37,6 +44,25 @@ logger = logging.getLogger(__name__)
 AIO_USERNAME   = os.getenv("AIO_USERNAME", "hsLee1509")
 AIO_ACTIVE_KEY = os.getenv("AIO_ACTIVE_KEY", "")
 
+# Gemini AI
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL   = "gemini-2.5-flash"  # Model có quota trên project này (5 RPM free tier)
+
+SYSTEM_PROMPT = (
+    "Bạn là bác sĩ chuyên khoa tim mạch giỏi, tên là Dr. AI. "
+    "Bạn sẽ được cung cấp dữ liệu sức khỏe thực tế từ các cảm biến và thông tin cá nhân của bệnh nhân. "
+    "Hãy đưa ra những lời khuyên chính xác, hữu ích, dễ hiểu bằng tiếng Việt. "
+    "Luôn dựa trên dữ liệu được cung cấp. Trả lời ngắn gọn, đi thẳng vào vấn đề. "
+    "Nếu dữ liệu không đủ, hãy nói rõ để người dùng biết."
+)
+
+if GEMINI_API_KEY and GEMINI_API_KEY != "PASTE_YOUR_GEMINI_KEY_HERE":
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    logger.info("✅ Gemini AI client đã khởi tạo (model: %s)", GEMINI_MODEL)
+else:
+    gemini_client = None
+    logger.warning("⚠️  GEMINI_API_KEY chưa được cấu hình. Endpoint /api/chat sẽ bị tắt.")
+
 AIO_BROKER     = "io.adafruit.com"
 AIO_PORT       = 1883
 
@@ -51,7 +77,7 @@ FEED_AI       = f"{AIO_USERNAME}/feeds/ai-feedback"
 DB_PATH = "sensor_history.db"
 
 def init_db():
-    """Tạo bảng sensor_history nếu chưa tồn tại."""
+    """Tạo bảng sensor_history và user_profile nếu chưa tồn tại."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS sensor_history (
@@ -61,6 +87,16 @@ def init_db():
                 humi      REAL,
                 bpm       REAL,
                 spo2      REAL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_profile (
+                id        INTEGER PRIMARY KEY CHECK (id = 1),
+                age       INTEGER NOT NULL,
+                gender    INTEGER NOT NULL,
+                weight    REAL    NOT NULL,
+                height    REAL    NOT NULL,
+                updated_at TEXT   NOT NULL
             )
         """)
         conn.commit()
@@ -90,57 +126,177 @@ def log_sensor_to_db(field: str, value: float):
 user_profile: dict | None = None
 profile_lock = threading.Lock()
 
-# AI Model Mock
-def load_model(model_path: str = "model.pkl"):
-    """
-    Mock: Giả lập việc load file .pkl bằng joblib.
-    Bỏ comment đoạn thật khi bạn có file model.pkl.
-    """
-    # --- KHI CÓ MODEL THẬT ---
-    # import joblib
-    # model = joblib.load(model_path)
-    # return model
-    # ------------------------------------
-
-    logger.info("🤖 [MOCK] Đã load AI model từ '%s'", model_path)
-
-    class MockModel:
-        LABELS = ["Normal", "Fatigue", "Stress", "Hypertension Risk", "Bradycardia"]
-
-        def predict(self, features: list) -> str:
-            result = random.choice(self.LABELS)
-            logger.info("🤖 [MOCK] Input features: %s → Prediction: %s", features, result)
-            return result
-
-    return MockModel()
-
-# Khởi tạo model một lần duy nhất
-ai_model = load_model()
-
-def run_ai_inference(bpm: float) -> str | None:
-    """
-    Kết hợp BPM với user profile rồi chạy model.predict().
-    Trả về None nếu profile chưa được cấu hình.
-    """
-    with profile_lock:
-        profile = user_profile
-
-    if profile is None:
-        logger.error(
-            "❌ AI Inference bị bỏ qua: Chưa nhận được profile người dùng qua POST /api/profile. "
-            "Vui lòng gửi profile trước."
+def save_profile_to_db(profile: dict):
+    """Lưu profile vào SQLite (UPSERT vào row duy nhất id=1)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO user_profile (id, age, gender, weight, height, updated_at)
+            VALUES (1, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                age        = excluded.age,
+                gender     = excluded.gender,
+                weight     = excluded.weight,
+                height     = excluded.height,
+                updated_at = excluded.updated_at
+            """,
+            (profile["age"], profile["gender"], profile["weight"],
+             profile["height"], datetime.now().isoformat()),
         )
+        conn.commit()
+    logger.info("💾 DB ← Profile saved: age=%d, gender=%d, weight=%.1f, height=%.1f",
+                profile["age"], profile["gender"], profile["weight"], profile["height"])
+
+def load_profile_from_db() -> dict | None:
+    """Đọc profile từ SQLite khi server khởi động. Trả về None nếu chưa có."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM user_profile WHERE id = 1").fetchone()
+    if row:
+        profile = {"age": row["age"], "gender": row["gender"],
+                   "weight": row["weight"], "height": row["height"]}
+        logger.info("📂 Profile loaded from DB: %s", profile)
+        return profile
+    return None
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  AI Blood Pressure Model (TorchScript CNN)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Đường dẫn tới model và metadata (nằm trong thư mục bidmc cùng cấp với backend)
+BIDMC_DIR = Path(__file__).resolve().parent.parent / "bidmc"
+MODEL_PATH = BIDMC_DIR / "model_cnn2_scripted.pt"
+META_PATH  = BIDMC_DIR / "model_cnn2_meta.json"
+
+# Load metadata (fs gốc của training, beat_len, class_names)
+try:
+    with open(META_PATH) as f:
+        model_meta = json.load(f)
+    MODEL_BEAT_LEN   = model_meta["beat_len"]    # 256
+    MODEL_TRAIN_FS   = model_meta["fs"]          # 1000 (chỉ để tham khảo, KHOONG dùng cho filter)
+    MODEL_CLASSES    = model_meta["class_names"]  # ["Hypertension", "Normal", "Prehypertension"]
+    logger.info("🧠 Model metadata loaded: beat_len=%d, train_fs=%d, classes=%s",
+                MODEL_BEAT_LEN, MODEL_TRAIN_FS, MODEL_CLASSES)
+except Exception as exc:
+    logger.error("❌ Không load được model metadata: %s", exc)
+    model_meta = None
+    MODEL_BEAT_LEN = 256
+    MODEL_TRAIN_FS = 1000
+    MODEL_CLASSES  = ["Hypertension", "Normal", "Prehypertension"]
+
+# Load TorchScript model
+try:
+    bp_model = torch.jit.load(str(MODEL_PATH), map_location="cpu").eval()
+    logger.info("✅ TorchScript model loaded: %s", MODEL_PATH)
+except Exception as exc:
+    bp_model = None
+    logger.error("❌ Không load được TorchScript model: %s", exc)
+
+
+def preprocess_and_predict(ir_data: list[float], sample_rate: float) -> str | None:
+    """
+    Tiền xử lý tín hiệu IR từ MAX30102 và chạy AI inference.
+
+    QUAN TRỌNG: Tham số bộ lọc được tính toán dựa trên `sample_rate` thực tế
+    (từ ESP32 gửi lên), KHÔNG dùng FS=1000 của training.
+
+    Pipeline:
+      1. Bandpass filter [0.5 - 8.0] Hz (Nyquist = sample_rate / 2)
+      2. Z-score normalize
+      3. Find R-peaks với distance tự động theo sample_rate
+      4. Cắt từng nhịp tim (beat segmentation)
+      5. Resample mỗi beat về BEAT_LEN=256
+      6. Normalize mỗi beat
+      7. Stack vào batch, chạy model, lấy softmax trung bình
+    """
+    if bp_model is None:
+        logger.error("❌ Model chưa được load, bỏ qua inference.")
         return None
 
-    features = [
-        bpm,
-        profile["age"],
-        profile["gender"],
-        profile["weight"],
-        profile["height"],
-    ]
-    prediction = ai_model.predict(features)
-    return prediction
+    signal_1d = np.array(ir_data, dtype=np.float64)
+
+    if len(signal_1d) < 50:
+        logger.warning("⚠️  Tín hiệu quá ngắn (%d samples), bỏ qua.", len(signal_1d))
+        return None
+
+    # ── 1. Bandpass Filter (điều chỉnh Nyquist theo sample_rate thực tế) ────
+    nyquist = sample_rate / 2.0
+    low_cut  = 0.5   # Hz
+    high_cut = 8.0   # Hz
+
+    # Đảm bảo dải lọc nằm trong giới hạn hợp lệ (0, 1) khi chuyen thành Wn
+    if high_cut >= nyquist:
+        high_cut = nyquist * 0.95  # Clíp xuống 95% Nyquist để tránh lỗi
+        logger.warning("⚠️  high_cut đã được clip xuống %.2f Hz (Nyquist=%.1f Hz)",
+                        high_cut, nyquist)
+
+    wn_low  = low_cut  / nyquist
+    wn_high = high_cut / nyquist
+
+    logger.info("📡 Preprocessing: FS=%.0f Hz, Nyquist=%.1f Hz, Wn=[%.4f, %.4f]",
+                sample_rate, nyquist, wn_low, wn_high)
+
+    b, a = butter(3, [wn_low, wn_high], btype="band")
+    filtered = filtfilt(b, a, signal_1d)
+
+    # ── 2. Normalize ─────────────────────────────────────────────────────
+    norm = (filtered - filtered.mean()) / (filtered.std() + 1e-8)
+
+    # ── 3. Find Peaks (distance thích ứng với sample_rate) ──────────────
+    # Khoảng cách tối thiểu giữa 2 peak = 0.4 giây (tương đương 150 BPM max)
+    min_distance = int(sample_rate * 0.4)
+    if min_distance < 1:
+        min_distance = 1
+
+    peaks, _ = find_peaks(norm, distance=min_distance, prominence=0.4)
+    logger.info("🔍 Tìm được %d peaks (distance=%d samples)", len(peaks), min_distance)
+
+    if len(peaks) < 2:
+        logger.warning("⚠️  Không đủ peaks để cắt nhịp tim (%d peaks).", len(peaks))
+        return None
+
+    # ── 4. Cắt từng nhịp tim (beat segmentation) ───────────────────────
+    beats = []
+    for i in range(len(peaks) - 1):
+        # Tính onset: điểm giữa peak trước và peak hiện tại
+        if i > 0:
+            onset = (peaks[i - 1] + peaks[i]) // 2
+        else:
+            onset = max(0, peaks[i] - (peaks[i + 1] - peaks[i]) // 2)
+        # Tính offset: điểm giữa peak hiện tại và peak tiếp theo
+        offset = (peaks[i] + peaks[i + 1]) // 2
+
+        seg = filtered[onset:offset]
+        if len(seg) < 30:
+            continue
+
+        # Resample về đúng BEAT_LEN=256 (giữ nguyên logic từ training)
+        seg = resample(seg, MODEL_BEAT_LEN).astype(np.float32)
+        seg = (seg - seg.mean()) / (seg.std() + 1e-8)
+        beats.append(seg)
+
+    logger.info("💓 Cắt được %d beats hợp lệ từ %d peaks.", len(beats), len(peaks))
+
+    if not beats:
+        logger.warning("⚠️  Không cắt được beat nào hợp lệ.")
+        return None
+
+    # ── 5. Inference ─────────────────────────────────────────────────────
+    x = torch.tensor(np.stack(beats)).unsqueeze(1)  # (N, 1, 256)
+
+    with torch.no_grad():
+        logits = bp_model(x)
+        probs  = torch.softmax(logits, dim=1).mean(0)  # Trung bình softmax của tất cả beats
+
+    predicted_idx   = probs.argmax().item()
+    predicted_label = MODEL_CLASSES[predicted_idx]
+    confidence      = probs[predicted_idx].item() * 100
+
+    logger.info("🎯 AI Prediction: %s (confidence: %.1f%%)", predicted_label, confidence)
+    logger.info("📊 Probabilities: %s",
+                {c: f"{p:.3f}" for c, p in zip(MODEL_CLASSES, probs.tolist())})
+
+    return predicted_label
 
 # MQTT Client
 mqtt_client = mqtt.Client(
@@ -196,12 +352,7 @@ def on_message(client, userdata, msg):
     # Ghi vào SQLite
     log_sensor_to_db(field, value)
 
-    # Kích hoạt AI chỉ khi nhận BPM
-    if field == "bpm":
-        prediction = run_ai_inference(bpm=value)
-        if prediction is not None:
-            client.publish(FEED_AI, prediction)
-            logger.info("📤 MQTT → [ai_feedback] = '%s'", prediction)
+    # (AI inference cho huyết áp đã chuyển sang endpoint /api/predict-bp qua HTTP POST)
 
 def start_mqtt():
     """Cấu hình và khởi động MQTT client ở background."""
@@ -221,8 +372,16 @@ def start_mqtt():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Khởi động DB và MQTT khi server start."""
+    global user_profile
     logger.info("🔧 Khởi động Smart Health Backend...")
     init_db()
+    # Khôi phục profile từ DB vào RAM (nếu đã từng lưu)
+    with profile_lock:
+        user_profile = load_profile_from_db()
+    if user_profile:
+        logger.info("✅ Profile đã được khôi phục từ DB.")
+    else:
+        logger.info("ℹ️  Chưa có profile nào trong DB.")
     start_mqtt()
     yield
     # Cleanup khi shutdown
@@ -245,16 +404,42 @@ class UserProfile(BaseModel):
     weight: float = Field(..., gt=0,          description="Cân nặng (kg)")
     height: float = Field(..., gt=0,          description="Chiều cao (cm)")
 
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, description="Câu hỏi của người dùng")
+    ai_feedback: str | None = Field(None, description="Kết quả từ AI model (nếu có)")
+
+class IRDataRequest(BaseModel):
+    """Payload từ ESP32: mảng IR (đã chia 64) + tần số lấy mẫu thực tế."""
+    ir_data: list[float] = Field(..., min_length=50, description="Mảng dữ liệu IR (đã chia 64), 300-500 phần tử")
+    sample_rate: float   = Field(..., gt=0,           description="Tần số lấy mẫu thực tế (Hz), ví dụ 100")
+
+def get_latest_sensor_data() -> dict:
+    """Lấy dữ liệu cảm biến mới nhất cho mỗi loại từ SQLite."""
+    result = {"bpm": None, "spo2": None, "temp": None, "humi": None}
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        for field in result:
+            row = conn.execute(
+                f"SELECT {field}, timestamp FROM sensor_history "
+                f"WHERE {field} IS NOT NULL ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if row:
+                result[field] = {"value": row[field], "timestamp": row["timestamp"]}
+    return result
+
 # API Endpoints
 @app.post("/api/profile", summary="Cập nhật hồ sơ người dùng")
 async def update_profile(profile: UserProfile):
     """
-    Nhận và lưu hồ sơ người dùng vào RAM.
+    Nhận và lưu hồ sơ người dùng vào RAM và SQLite.
     Dữ liệu này sẽ được kết hợp với BPM để chạy AI model.
     """
     global user_profile
+    data = profile.model_dump()
     with profile_lock:
-        user_profile = profile.model_dump()
+        user_profile = data
+    # Lưu bền vững vào SQLite
+    save_profile_to_db(data)
 
     logger.info(
         "👤 Profile cập nhật: age=%d, gender=%d, weight=%.1fkg, height=%.1fcm",
@@ -292,8 +477,129 @@ async def health_check():
         "status": "ok",
         "mqtt_connected": mqtt_connected,
         "profile_loaded": user_profile is not None,
+        "bp_model_loaded": bp_model is not None,
         "timestamp": datetime.now().isoformat(),
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  API Endpoint: Nhận mảng IR từ ESP32 và dự đoán huyết áp
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/predict-bp", summary="Dự đoán huyết áp từ tín hiệu IR")
+async def predict_blood_pressure(request: IRDataRequest):
+    """
+    Nhận mảng dữ liệu IR từ ESP32-C3 (qua HTTP POST), tiền xử lý tín hiệu
+    với tham số filter/peak tự thích ứng theo sample_rate thực tế,
+    chạy TorchScript model và trả kết quả.
+
+    Kết quả đồng thời được publish lên Adafruit IO feed "ai-feedback".
+    """
+    if bp_model is None:
+        raise HTTPException(
+            status_code=503,
+            detail="AI model chưa được load. Kiểm tra file model_cnn2_scripted.pt."
+        )
+
+    logger.info("📥 Nhận %d mẫu IR từ ESP32 (sample_rate=%.0f Hz)",
+                len(request.ir_data), request.sample_rate)
+
+    # Chạy tiền xử lý + inference
+    prediction = preprocess_and_predict(request.ir_data, request.sample_rate)
+
+    if prediction is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Không thể xử lý tín hiệu IR. Có thể tín hiệu quá nhiễu, "
+                   "không tìm thấy nhịp tim hoặc chất lượng dữ liệu kém."
+        )
+
+    # Publish kết quả lên Adafruit IO feed ai-feedback
+    if mqtt_client.is_connected():
+        mqtt_client.publish(FEED_AI, prediction)
+        logger.info("📤 MQTT → [ai-feedback] = '%s'", prediction)
+    else:
+        logger.warning("⚠️  MQTT chưa kết nối, không thể publish ai-feedback.")
+
+    return {
+        "status": "success",
+        "prediction": prediction,
+        "samples_received": len(request.ir_data),
+        "sample_rate": request.sample_rate,
+    }
+
+@app.post("/api/chat", summary="Hỏi bác sĩ AI tim mạch")
+async def chat_with_ai(request: ChatRequest):
+    """
+    Nhận câu hỏi từ người dùng, xây dựng context từ dữ liệu cảm biến
+    và profile, sau đó gọi Gemini AI để trả lời như một bác sĩ tim mạch.
+    """
+    if gemini_client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Gemini AI chưa được cấu hình. Vui lòng thêm GEMINI_API_KEY vào file .env."
+        )
+
+    # Lấy dữ liệu thực tế
+    sensor_data = get_latest_sensor_data()
+    with profile_lock:
+        profile = user_profile
+
+    # --- Xây dựng context cho Gemini ---
+    profile_text = "Chưa có thông tin cá nhân." if profile is None else (
+        f"- Tuổi: {profile['age']}\n"
+        f"- Giới tính: {'Nam' if profile['gender'] == 1 else 'Nữ'}\n"
+        f"- Cân nặng: {profile['weight']} kg\n"
+        f"- Chiều cao: {profile['height']} cm\n"
+        f"- BMI: {profile['weight'] / (profile['height'] / 100) ** 2:.1f}"
+    )
+
+    def fmt(field_data):
+        if field_data is None:
+            return "Không có dữ liệu"
+        return f"{field_data['value']:.1f} (lúc {field_data['timestamp'][:19]})"
+
+    sensor_text = (
+        f"- Nhịp tim (BPM): {fmt(sensor_data['bpm'])}\n"
+        f"- SpO2: {fmt(sensor_data['spo2'])}%\n"
+        f"- Nhiệt độ phòng: {fmt(sensor_data['temp'])}°C\n"
+        f"- Độ ẩm phòng: {fmt(sensor_data['humi'])}%"
+    )
+
+    ai_text = (
+        f"- Nhận định từ AI model: {request.ai_feedback}"
+        if request.ai_feedback else "- Không có nhận định từ AI model."
+    )
+
+    context_prompt = (
+        f"=== THÔNG TIN BỆNH NHÂN ===\n{profile_text}\n\n"
+        f"=== DỮ LIỆU CẢM BIẾN MỚI NHẤT ===\n{sensor_text}\n\n"
+        f"=== NHẬN ĐỊNH AI ===\n{ai_text}\n\n"
+        f"=== CÂU HỎI CỦA BỆNH NHÂN ===\n{request.message}"
+    )
+
+    logger.info("🤖 Gọi Gemini AI với câu hỏi: '%s'", request.message)
+
+    try:
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=context_prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                temperature=0.7,
+            ),
+        )
+        answer = response.text
+        logger.info("✅ Gemini phản hồi thành công (%d ký tự)", len(answer))
+        return {
+            "status": "success",
+            "question": request.message,
+            "answer": answer,
+        }
+    except Exception as exc:
+        logger.error("❌ Gemini API lỗi: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Gemini API lỗi: {exc}")
+
 
 # Entry Point
 if __name__ == "__main__":

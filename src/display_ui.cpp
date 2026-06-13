@@ -61,37 +61,51 @@ void display_update(ScreenState state) {
     }
     // TRANG 2: MÔI TRƯỜNG KÝ TÚC XÁ
     else if (state == SCREEN_ENV) {
-        float temp = get_temp();
-        float humi = get_humi();
-
         u8g2.setFont(u8g2_font_ncenB12_tr);
         u8g2.setCursor(10, 35);
-        u8g2.print("Temp: "); u8g2.print(temp, 1); u8g2.print(" C");
+        u8g2.print("Temp: ");
+        if (env_is_valid()) { u8g2.print(get_temp(), 1); u8g2.print(" C"); }
+        else                { u8g2.print("--- C"); }
 
         u8g2.setCursor(10, 55);
-        u8g2.print("Humi: "); u8g2.print(humi, 1); u8g2.print(" %");
+        u8g2.print("Humi: ");
+        if (env_is_valid()) { u8g2.print(get_humi(), 1); u8g2.print(" %"); }
+        else                { u8g2.print("--- %"); }
     } 
     // TRANG 3: NHỊP TIM & SpO2
     else if (state == SCREEN_HEALTH) {
-        int bpm = get_bpm();
-        int spo2 = get_spo2();
         long raw_ir = get_raw_ir();
 
         if (raw_ir < 50000) {
+            // Trạng thái 1: Chưa đặt ngón tay
             u8g2.setFont(u8g2_font_ncenB08_tr);
             u8g2.drawStr(10, 40, "Put finger on sensor");
             for(int i = 0; i < GRAPH_WIDTH; i++) ir_buffer[i] = 0;
         } else {
-            u8g2.setFont(u8g2_font_ncenB12_tr);
-            u8g2.setCursor(0, 32);
-            u8g2.print("BPM:"); u8g2.print(bpm);
-            
-            u8g2.setCursor(80, 32);
-            u8g2.print(spo2); u8g2.print("%");
-
+            // Cập nhật buffer PPG để vẽ sóng (luôn làm dù đang warming up)
             ir_buffer[ir_index] = raw_ir;
             ir_index = (ir_index + 1) % GRAPH_WIDTH;
 
+            u8g2.setFont(u8g2_font_ncenB12_tr);
+            u8g2.setCursor(0, 32);
+            u8g2.print("BPM:");
+
+            if (health_is_ready()) {
+                // Trạng thái 3: Đã đủ mẫu — hiện giá trị thực
+                u8g2.print(get_bpm());
+
+                u8g2.setCursor(80, 32);
+                int spo2 = get_spo2();
+                if (spo2 > 0) { u8g2.print(spo2); u8g2.print("%"); }
+                else          { u8g2.print("---%"); }
+            } else {
+                // Trạng thái 2: Có ngón tay nhưng chưa đủ mẫu
+                u8g2.print("---");
+                u8g2.setCursor(80, 32);
+                u8g2.print("---%");
+            }
+
+            // Vẽ sóng PPG
             long min_val = ir_buffer[0];
             long max_val = ir_buffer[0];
             for (int i = 1; i < GRAPH_WIDTH; i++) {
@@ -99,14 +113,14 @@ void display_update(ScreenState state) {
                 if (ir_buffer[i] > max_val) max_val = ir_buffer[i];
             }
 
-            if (max_val - min_val > 50) { 
+            if (max_val - min_val > 50) {
                 int prev_y = 0;
                 for (int i = 0; i < GRAPH_WIDTH; i++) {
                     int data_idx = (ir_index + i) % GRAPH_WIDTH;
                     if (ir_buffer[data_idx] == 0) continue;
 
                     int y = 63 - ((ir_buffer[data_idx] - min_val) * 28 / (max_val - min_val));
-                    
+
                     if (i > 0) {
                         u8g2.drawLine(i - 1, prev_y, i, y);
                     }

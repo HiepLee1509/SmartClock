@@ -1,4 +1,5 @@
 #include "config.h"
+#include "bp_sender.h"
 #include "display_ui.h"
 #include "mqtt_manager.h"
 #include "network_manager.h"
@@ -11,25 +12,22 @@
 
 ScreenState currentState = SCREEN_CLOCK;
 
-// Các biến lưu thời gian để chia luồng (Timer)
 unsigned long lastDisplayUpdate = 0;
-unsigned long lastSerialPrint = 0;
-unsigned long lastEnvUpdate = 0;      // Timer cho SHT31
-unsigned long lastMqttEnvPublish = 0; // Timer gửi dữ liệu môi trường lên MQTT
-unsigned long lastMqttHealthPublish = 0; // Timer gửi dữ liệu sức khỏe lên MQTT
+unsigned long lastEnvUpdate = 0;
+unsigned long lastMqttEnvPublish = 0;
+unsigned long lastMqttHealthPublish = 0;
 
 // Cấu hình cảnh báo nhiệt độ phòng cao
 bool isTempAlertActive = false;
 unsigned long tempAlertStartTime = 0;
-unsigned long lastTempAlertEndTime =
-    0; // Ghi nhận thời điểm lần cảnh báo trước kết thúc
+unsigned long lastTempAlertEndTime = 0;
 
 void setup() {
   Serial.begin(115200);
   delay(2000);
 
-  network_init(); // dua len dau de tranh loi sut ap khi ket noi wifi
-  mqtt_init();    // Khởi tạo các cấu hình cho MQTT Client
+  network_init();
+  mqtt_init();
 
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, I2C_SPEED);
 
@@ -43,14 +41,18 @@ void setup() {
   // KHÔNG tham số, làm reset bus I2C về pin mặc định của ESP32-C3
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, I2C_SPEED);
 
-  env_update(); // Cập nhật dữ liệu môi trường lần đầu ngay khi khởi động
+  env_update();
+
+  // Khởi tạo module gửi IR buffer lên Backend cho AI huyết áp
+  bp_sender_init(BACKEND_BP_URL);
 }
 
 void loop() {
-  // 1. Quét cảm biến nhịp tim liên tục (càng nhanh càng tốt để vét sạch FIFO)
   health_update();
 
-  // 2. Quét cảm biến chạm UI
+  // Cấp nhật module BP sender: gửi raw IR vào để tự động gom buffer và gửi
+  bp_sender_update(get_raw_ir());
+
   TouchAction action = touch_get_action();
 
   if (action == TOUCH_SHORT) {
@@ -62,15 +64,13 @@ void loop() {
     touch_check_deep_sleep(action);
   }
 
-  // 3. Cập nhật dữ liệu môi trường mỗi 5 giây (đủ để hiển thị mà không làm chậm
-  // I2C của MAX30102)
+  // Cập nhật dữ liệu môi trường mỗi 5 giây
   if (millis() - lastEnvUpdate >= 5000) {
     env_update();
     lastEnvUpdate = millis();
 
-    // Kích hoạt cảnh báo nếu nhiệt độ vượt quá 30 độ C và hết thời gian giãn
-    // cách 30s
-    if (get_temp() > 30.0) {
+    // Kích hoạt cảnh báo chỉ khi đã có dữ liệu hợp lệ và nhiệt độ vượt 30°C
+    if (env_is_valid() && get_temp() > 30.0) {
       if (!isTempAlertActive && (lastTempAlertEndTime == 0 ||
                                  millis() - lastTempAlertEndTime >= 20000)) {
         isTempAlertActive = true;
@@ -85,8 +85,7 @@ void loop() {
     lastTempAlertEndTime = millis(); // Ghi nhận thời điểm kết thúc cảnh báo
   }
 
-  // 4. Cập nhật OLED mỗi 30ms (~33 FPS) để giải phóng băng thông I2C cho
-  // MAX30102
+  // Cập nhật OLED mỗi 30ms (~33 FPS)
   if (millis() - lastDisplayUpdate >= 30) {
     if (isTempAlertActive && currentState == SCREEN_ENV) {
       display_show_temp_alert();
@@ -96,19 +95,9 @@ void loop() {
     lastDisplayUpdate = millis();
   }
 
-  // 5. In dữ liệu ra Serial Monitor đúng 1 giây 1 lần
-  if (millis() - lastSerialPrint >= 1000) {
-    Serial.printf(
-        "Temp: %.1fC | Humi: %.1f%% | IR: %ld | BPM: %d | SpO2: %d%%\n",
-        get_temp(), get_humi(), get_raw_ir(), get_bpm(), get_spo2());
-    lastSerialPrint = millis();
-  }
-
-  // 6. Xử lý vòng lặp MQTT duy trì kết nối (non-blocking)
   mqtt_loop();
 
-  // 7. Gửi dữ liệu môi trường lên Adafruit IO mỗi 10 giây (non-blocking)
-  // Gửi ngay lập tức ở giây đầu tiên khi kết nối thành công
+  // Gửi dữ liệu môi trường lên Adafruit IO mỗi 10 giây
   static bool envPublishPending = true;
   if (envPublishPending ||
       (millis() - lastMqttEnvPublish >= MQTT_PUBLISH_ENV_INTERVAL_MS)) {
@@ -118,8 +107,7 @@ void loop() {
     }
   }
 
-  // 8. Gửi dữ liệu sức khỏe lên Adafruit IO mỗi 3 giây (non-blocking)
-  // Gửi số 0 một lần duy nhất ngay khi rút tay ra
+  // Gửi dữ liệu sức khỏe lên Adafruit IO mỗi 3 giây
   static bool wasHealthZero = true;
   int bpm = get_bpm();
   int spo2 = get_spo2();
